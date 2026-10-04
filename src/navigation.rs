@@ -1,4 +1,5 @@
 use crate::cloudflare::{MetricRow, Snapshot};
+use std::cell::RefCell;
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -7,7 +8,7 @@ pub enum View {
     Details,
     Logs,
 }
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub enum Sort {
     Name,
     #[default]
@@ -41,21 +42,42 @@ pub struct Browser {
     pub selected: Option<String>,
     pub view: View,
     pub worker: Option<String>,
+    cache: RefCell<Option<RowCache>>,
+}
+struct RowCache {
+    filter: String,
+    sort: Sort,
+    tab: usize,
+    indices: Vec<usize>,
 }
 impl Browser {
+    pub fn invalidate(&mut self) {
+        *self.cache.get_mut() = None;
+    }
     pub fn rows<'a>(&self, snapshot: &'a Snapshot, tab: usize) -> Vec<&'a MetricRow> {
         let source = if tab == 0 {
             &snapshot.workers
         } else {
             &snapshot.databases
         };
+        let mut cache = self.cache.borrow_mut();
+        if let Some(cached) = &*cache {
+            if cached.filter == self.filter && cached.sort == self.sort && cached.tab == tab {
+                return cached
+                    .indices
+                    .iter()
+                    .filter_map(|&i| source.as_ref()?.get(i))
+                    .collect();
+            }
+        }
         let filter = self.filter.to_lowercase();
         let mut rows = source
             .iter()
             .flatten()
-            .filter(|row| row.name.to_lowercase().contains(&filter))
+            .enumerate()
+            .filter(|(_, row)| filter.is_empty() || row.name.to_lowercase().contains(&filter))
             .collect::<Vec<_>>();
-        rows.sort_by(|a, b| {
+        rows.sort_by(|(_, a), (_, b)| {
             let order = match self.sort {
                 Sort::Name => a.name.cmp(&b.name),
                 Sort::Activity => b.first.cmp(&a.first),
@@ -65,7 +87,13 @@ impl Browser {
             };
             order.then_with(|| a.name.cmp(&b.name))
         });
-        rows
+        *cache = Some(RowCache {
+            filter: self.filter.clone(),
+            sort: self.sort,
+            tab,
+            indices: rows.iter().map(|(i, _)| *i).collect(),
+        });
+        rows.into_iter().map(|(_, row)| row).collect()
     }
     pub fn reconcile(&mut self, snapshot: &Snapshot, tab: usize) {
         let rows = self.rows(snapshot, tab);

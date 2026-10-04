@@ -1,5 +1,7 @@
 mod cloudflare;
 mod config;
+mod context;
+mod deployment;
 mod input;
 mod logs;
 mod navigation;
@@ -25,10 +27,21 @@ use panels::{Panel, Panels};
 use shell::Shell;
 use std::{
     io,
-    sync::mpsc,
+    sync::{mpsc, OnceLock},
     thread,
     time::{Duration, Instant},
 };
+
+enum Update {
+    Wake,
+    Input(Event),
+}
+static UPDATES: OnceLock<mpsc::SyncSender<Update>> = OnceLock::new();
+pub(crate) fn wake() {
+    if let Some(tx) = UPDATES.get() {
+        let _ = tx.try_send(Update::Wake);
+    }
+}
 
 pub struct App {
     pub snapshot: Option<Snapshot>,
@@ -46,6 +59,8 @@ pub struct App {
     pub message: String,
     pub help: bool,
     pub request: request::Inspector,
+    pub context: context::Status,
+    pub deployment: deployment::Status,
 }
 impl App {
     pub fn new(demo: bool, account: String, projects: Vec<config::Project>) -> Self {
@@ -65,6 +80,8 @@ impl App {
             message: String::new(),
             help: false,
             request: request::Inspector::default(),
+            context: context::Status::default(),
+            deployment: deployment::Status::default(),
         }
     }
 }
@@ -109,8 +126,11 @@ fn main() -> Result<()> {
         .iter()
         .position(|p| p.name == saved.project)
         .unwrap_or(0);
+    let (updates_tx, updates_rx) = mpsc::sync_channel(512);
+    let _ = UPDATES.set(updates_tx.clone());
     let mut sessions = sessions::Sessions::new(config.projects.clone(), project, &config.shell)?;
-    // One worker owns all HTTP requests. No overlapping refreshes.
+    let mut deployments = deployment::Monitor::new(client.clone());
+    // One worker owns analytics requests. No overlapping refreshes.
     let (request_tx, request_rx) = mpsc::sync_channel::<()>(1);
     let (result_tx, result_rx) = mpsc::channel();
     thread::spawn(move || {
@@ -121,6 +141,7 @@ fn main() -> Result<()> {
             if result_tx.send(snapshot).is_err() {
                 break;
             }
+            wake();
         }
     });
     request_tx.send(())?;
@@ -132,48 +153,92 @@ fn main() -> Result<()> {
     app.panels = saved.panels;
     app.project = project;
     app.message = state_warning;
+    let mut context = context::Monitor::new(config.shell.clone());
+    context.refresh(project, &app.projects[project]);
     let mut terminal = ratatui::init();
     let result = (|| -> Result<()> {
         execute!(io::stdout(), EnableBracketedPaste, EnableMouseCapture)?;
+        thread::spawn(move || {
+            while let Ok(event) = event::read() {
+                if updates_tx.send(Update::Input(event)).is_err() {
+                    break;
+                }
+            }
+        });
         let mut last_refresh = Instant::now();
+        let mut last_context = Instant::now();
+        let mut dirty = true;
         loop {
-            sessions.drain()?;
-            app.logs.drain();
-            app.request.drain();
-            if app.logs.follow && !app.logs.paused() && !app.logs.expanded {
-                app.logs.selected = app.logs.rows().len().saturating_sub(1);
+            dirty |= sessions.drain()?;
+            dirty |= app.logs.drain();
+            dirty |= app.request.drain();
+            if context.drain(app.project, &mut app.context) {
+                dirty = true;
+            }
+            if last_context.elapsed() >= Duration::from_secs(5) {
+                context.refresh(app.project, &app.projects[app.project]);
+                last_context = Instant::now();
+            }
+            if dirty && app.logs.follow && !app.logs.paused() && !app.logs.expanded {
+                let last = app.logs.rows().len().saturating_sub(1);
+                app.logs.selected = last;
             }
             if let Ok(snapshot) = result_rx.try_recv() {
                 app.snapshot = Some(snapshot);
+                app.browser.invalidate();
                 if let Some(snapshot) = &app.snapshot {
                     app.browser.reconcile(snapshot, app.tab);
                 }
                 app.refreshing = false;
                 last_refresh = Instant::now();
+                dirty = true;
             }
             if !app.refreshing
                 && last_refresh.elapsed() >= Duration::from_secs(config.refresh_seconds)
             {
                 request_tx.try_send(())?;
                 app.refreshing = true;
+                dirty = true;
             }
-            let area = terminal.size()?;
-            let shell_area = ui::shell_area(
-                ratatui::layout::Rect::new(0, 0, area.width, area.height),
-                &app.panels,
-            );
-            if !shell_area.is_empty() {
-                sessions.shell().resize(
-                    shell_area.height.saturating_sub(2),
-                    shell_area.width.saturating_sub(2),
-                )?;
+            let selected_worker = app.browser.worker.as_deref().or({
+                if app.tab == 0 {
+                    app.browser.selected.as_deref()
+                } else {
+                    None
+                }
+            });
+            dirty |= deployments.update(selected_worker, &mut app.deployment, false);
+            if dirty {
+                let area = terminal.size()?;
+                let shell_area = ui::shell_area(
+                    ratatui::layout::Rect::new(0, 0, area.width, area.height),
+                    &app.panels,
+                );
+                if !shell_area.is_empty() {
+                    sessions.shell().resize(
+                        shell_area.height.saturating_sub(2),
+                        shell_area.width.saturating_sub(2),
+                    )?;
+                }
+                let shell = sessions.shell();
+                terminal.draw(|frame| ui::draw(frame, &app, shell.parser.screen(), shell.ended))?;
+                dirty = false;
             }
-            let shell = sessions.shell();
-            terminal.draw(|frame| ui::draw(frame, &app, shell.parser.screen(), shell.ended))?;
-            if !event::poll(Duration::from_millis(33))? {
-                continue;
-            }
-            match event::read()? {
+            let timeout = Duration::from_secs(5)
+                .saturating_sub(last_context.elapsed())
+                .min(if app.refreshing {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::from_secs(config.refresh_seconds)
+                        .saturating_sub(last_refresh.elapsed())
+                });
+            let event = match updates_rx.recv_timeout(timeout) {
+                Ok(Update::Input(event)) => event,
+                Ok(Update::Wake) | Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+            dirty = true;
+            match event {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     match input::key(&mut app, key) {
                         input::Action::Quit => break,
@@ -182,6 +247,8 @@ fn main() -> Result<()> {
                         input::Action::Refresh if !app.refreshing => {
                             request_tx.try_send(())?;
                             app.refreshing = true;
+                            let worker = app.deployment.worker.clone();
+                            deployments.update(worker.as_deref(), &mut app.deployment, true);
                         }
                         input::Action::Refresh => {}
                         input::Action::Save => {
@@ -202,6 +269,8 @@ fn main() -> Result<()> {
                                         app.logs.stop();
                                     }
                                     app.project = index;
+                                    app.context = context::Status::default();
+                                    context.refresh(index, &app.projects[index]);
                                     app.message = format!(
                                         "Project: {} · separate Bash session",
                                         app.projects[index].name
@@ -251,6 +320,7 @@ fn main() -> Result<()> {
                         mouse.row,
                     );
                 }
+                Event::Resize(_, _) => {}
                 Event::Paste(text)
                     if app.request.editing && app.project_picker.is_none() && !app.help =>
                 {

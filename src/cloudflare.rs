@@ -160,12 +160,41 @@ impl Snapshot {
     }
 }
 
+#[derive(Clone)]
 pub struct Cloudflare {
     client: Client,
     account: String,
     token: String,
 }
 impl Cloudflare {
+    pub fn deployment(&self, worker: &str) -> Result<String> {
+        let mut url = reqwest::Url::parse("https://api.cloudflare.com/client/v4/")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Invalid API URL"))?
+            .pop_if_empty()
+            .extend([
+                "accounts",
+                &self.account,
+                "workers",
+                "scripts",
+                worker,
+                "deployments",
+            ]);
+        let response = self
+            .client
+            .get(url)
+            .query(&[("per_page", "1")])
+            .bearer_auth(&self.token)
+            .send()
+            .context("Deployment connection failed")?;
+        if !response.status().is_success() {
+            bail!(
+                "HTTP {} · needs Workers Scripts Read or Workers Tail Read",
+                response.status()
+            );
+        }
+        deployment_summary(&response.json::<Value>()?)
+    }
     pub fn new(account: String, token: String) -> Result<Self> {
         Ok(Self {
             client: Client::builder().timeout(Timeout::from_secs(20)).build()?,
@@ -249,6 +278,60 @@ impl Cloudflare {
             database_history,
             warnings,
         }
+    }
+}
+
+fn deployment_summary(body: &Value) -> Result<String> {
+    if body["success"] != true {
+        bail!("Deployment API returned an error");
+    }
+    let deployments = body["result"]["deployments"]
+        .as_array()
+        .context("Missing deployments")?;
+    let Some(last) = deployments.first() else {
+        return Ok("No deployment recorded".into());
+    };
+    let versions = last["versions"]
+        .as_array()
+        .context("Missing deployment versions")?
+        .iter()
+        .map(|v| {
+            format!(
+                "{} {}%",
+                v["version_id"]
+                    .as_str()
+                    .unwrap_or("?")
+                    .chars()
+                    .take(8)
+                    .collect::<String>(),
+                v["percentage"]
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" + ");
+    Ok(crate::request::safe_text(&format!(
+        "Serving · {} · {} · {}",
+        last["created_on"].as_str().unwrap_or("unknown time"),
+        versions,
+        last["annotations"]["workers/message"]
+            .as_str()
+            .unwrap_or("")
+    )))
+}
+
+#[cfg(test)]
+mod deployment_tests {
+    use super::*;
+    #[test]
+    fn reports_serving_split_and_empty_deployments() {
+        let body = json!({"success":true,"result":{"deployments":[{"created_on":"2026-10-04T12:00:00Z","versions":[{"version_id":"aaaaaaaa-1","percentage":90},{"version_id":"bbbbbbbb-2","percentage":10}]}]}});
+        let result = deployment_summary(&body).unwrap();
+        assert!(result.contains("aaaaaaaa 90% + bbbbbbbb 10%"));
+        assert_eq!(
+            deployment_summary(&json!({"success":true,"result":{"deployments":[]}})).unwrap(),
+            "No deployment recorded"
+        );
+        assert!(deployment_summary(&json!({"success":false})).is_err());
     }
 }
 

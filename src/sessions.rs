@@ -33,11 +33,14 @@ impl Sessions {
         self.active = index;
         Ok(())
     }
-    pub fn drain(&mut self) -> Result<()> {
-        for shell in self.shells.iter_mut().flatten() {
-            shell.drain()?;
+    pub fn drain(&mut self) -> Result<bool> {
+        let mut changed = false;
+        for (index, shell) in self.shells.iter_mut().enumerate() {
+            if let Some(shell) = shell {
+                changed |= shell.drain()? && index == self.active;
+            }
         }
-        Ok(())
+        Ok(changed)
     }
     pub fn shell(&mut self) -> &mut Shell {
         self.shells[self.active].as_mut().unwrap()

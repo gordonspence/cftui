@@ -2,6 +2,7 @@ use crate::config::Project;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::{
+    cell::{Ref, RefCell},
     collections::VecDeque,
     io::{BufRead, BufReader, Read},
     path::Path,
@@ -20,13 +21,58 @@ pub struct Entry {
     pub detail: String,
     pub error: bool,
     pub invocation: bool,
+    search: String,
+}
+const BUFFER_BYTES: usize = 16 * 1024 * 1024;
+const ENTRY_LIMIT: usize = 500;
+impl Entry {
+    fn new(summary: String, detail: String, error: bool, invocation: bool) -> Self {
+        fn bounded(mut text: String, limit: usize) -> String {
+            if text.len() > limit {
+                let mut end = limit.saturating_sub(32);
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+                text.push_str("\n[truncated by cftui]");
+            }
+            text.shrink_to_fit();
+            text
+        }
+        let summary = bounded(summary, 2048);
+        let detail = bounded(detail, 32 * 1024);
+        let mut search = detail.to_lowercase();
+        search.shrink_to_fit();
+        Self {
+            summary,
+            detail,
+            search,
+            error,
+            invocation,
+        }
+    }
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + 2 * std::mem::size_of::<usize>()
+            + self.summary.capacity()
+            + self.detail.capacity()
+            + self.search.capacity()
+    }
+}
+#[derive(Default)]
+struct RowCache {
+    key: Option<(String, bool)>,
+    rows: Vec<Arc<Entry>>,
 }
 pub struct Logs {
     child: Option<Child>,
     input: Option<Receiver<Entry>>,
     dropped: Arc<AtomicUsize>,
-    pub entries: VecDeque<Entry>,
-    frozen: Option<Vec<Entry>>,
+    entries: VecDeque<Arc<Entry>>,
+    frozen: Option<Vec<Arc<Entry>>>,
+    bytes: usize,
+    last_dropped: usize,
+    cache: RefCell<RowCache>,
     pub filter: String,
     pub errors_only: bool,
     pub selected: usize,
@@ -44,6 +90,9 @@ impl Default for Logs {
             dropped: Arc::new(AtomicUsize::new(0)),
             entries: VecDeque::new(),
             frozen: None,
+            bytes: 0,
+            last_dropped: 0,
+            cache: RefCell::default(),
             filter: String::new(),
             errors_only: false,
             selected: 0,
@@ -66,20 +115,22 @@ impl Logs {
     ) -> Result<()> {
         self.stop();
         self.entries.clear();
+        self.bytes = 0;
+        self.invalidate();
         self.frozen = None;
         self.selected = 0;
         self.expanded = false;
         self.follow = true;
         self.target = Some(worker.into());
         self.dropped.store(0, Ordering::Relaxed);
+        self.last_dropped = 0;
         if demo {
             self.status = "DEMO sample events · no remote tail started".into();
             for text in [
                 r#"{"outcome":"ok","eventTimestamp":1720000000000,"event":{"request":{"method":"GET","url":"https://example.com/health"}},"logs":[{"level":"log","message":["health check passed"]}],"exceptions":[]}"#,
                 r#"{"outcome":"exception","eventTimestamp":1720000001000,"event":{"request":{"method":"POST","url":"https://example.com/api"}},"logs":[],"exceptions":[{"name":"Error","message":"Demo: database request failed"}]}"#,
             ] {
-                self.entries
-                    .push_back(parse_event(&serde_json::from_str(text)?));
+                self.push(parse_event(&serde_json::from_str(text)?));
             }
             return Ok(());
         }
@@ -118,7 +169,7 @@ impl Logs {
         let mut child = command
             .spawn()
             .context("Could not launch Wrangler log stream")?;
-        let (tx, rx) = mpsc::sync_channel(256);
+        let (tx, rx) = mpsc::sync_channel(8);
         reader(
             child.stdout.take().unwrap(),
             tx.clone(),
@@ -130,21 +181,17 @@ impl Logs {
         self.status = "Connecting via Wrangler · read-only live tail".into();
         Ok(())
     }
-    pub fn drain(&mut self) {
-        if let Some(input) = &self.input {
-            for _ in 0..256 {
-                let Ok(entry) = input.try_recv() else { break };
-                if entry.invocation {
-                    self.status = "Live · receiving invocations via Wrangler".into();
-                }
-                self.entries.push_back(entry);
-                if self.entries.len() > 500 {
-                    self.entries.pop_front();
-                    if self.frozen.is_none() {
-                        self.selected = self.selected.saturating_sub(1);
-                    }
-                }
+    pub fn drain(&mut self) -> bool {
+        let old_status = self.status.clone();
+        let mut changed = false;
+        for _ in 0..8 {
+            let Some(input) = &self.input else { break };
+            let Ok(entry) = input.try_recv() else { break };
+            if entry.invocation {
+                self.status = "Live · receiving invocations via Wrangler".into();
             }
+            self.push(entry);
+            changed = true;
         }
         if let Some(child) = &mut self.child {
             match child.try_wait() {
@@ -154,6 +201,26 @@ impl Logs {
                 }
                 Err(e) => self.status = format!("Tail status unavailable: {e}"),
                 _ => {}
+            }
+        }
+        let dropped = self.dropped();
+        changed |= dropped != self.last_dropped;
+        self.last_dropped = dropped;
+        changed || old_status != self.status
+    }
+    fn invalidate(&mut self) {
+        *self.cache.get_mut() = RowCache::default();
+    }
+    fn push(&mut self, entry: Entry) {
+        self.invalidate();
+        self.bytes += entry.bytes();
+        self.entries.push_back(Arc::new(entry));
+        while self.entries.len() > ENTRY_LIMIT || self.bytes > BUFFER_BYTES {
+            if let Some(old) = self.entries.pop_front() {
+                self.bytes -= old.bytes();
+                if self.frozen.is_none() {
+                    self.selected = self.selected.saturating_sub(1);
+                }
             }
         }
     }
@@ -179,12 +246,14 @@ impl Logs {
         self.status = "Tail stopped · L restarts".into();
     }
     pub fn pause(&mut self) {
+        self.invalidate();
         self.frozen = if self.frozen.is_some() {
             None
         } else {
             Some(self.entries.iter().cloned().collect())
         };
-        self.selected = self.selected.min(self.rows().len().saturating_sub(1));
+        let last = self.rows().len().saturating_sub(1);
+        self.selected = self.selected.min(last);
     }
     pub fn paused(&self) -> bool {
         self.frozen.is_some()
@@ -192,16 +261,34 @@ impl Logs {
     pub fn dropped(&self) -> usize {
         self.dropped.load(Ordering::Relaxed)
     }
-    pub fn rows(&self) -> Vec<&Entry> {
-        let source: Vec<_> = self.frozen.as_ref().map_or_else(
-            || self.entries.iter().collect(),
-            |entries| entries.iter().collect(),
-        );
-        let filter = self.filter.to_lowercase();
-        source
-            .into_iter()
-            .filter(|e| (!self.errors_only || e.error) && e.detail.to_lowercase().contains(&filter))
-            .collect()
+    pub fn rows(&self) -> Ref<'_, Vec<Arc<Entry>>> {
+        let mut cache = self.cache.borrow_mut();
+        if !cache
+            .key
+            .as_ref()
+            .is_some_and(|(filter, errors)| filter == &self.filter && *errors == self.errors_only)
+        {
+            let filter = self.filter.to_lowercase();
+            cache.rows = self.frozen.as_ref().map_or_else(
+                || {
+                    self.entries
+                        .iter()
+                        .filter(|e| (!self.errors_only || e.error) && e.search.contains(&filter))
+                        .cloned()
+                        .collect()
+                },
+                |entries| {
+                    entries
+                        .iter()
+                        .filter(|e| (!self.errors_only || e.error) && e.search.contains(&filter))
+                        .cloned()
+                        .collect()
+                },
+            );
+            cache.key = Some((self.filter.clone(), self.errors_only));
+        }
+        drop(cache);
+        Ref::map(self.cache.borrow(), |cache| &cache.rows)
     }
 }
 impl Drop for Logs {
@@ -249,17 +336,41 @@ fn parse_event(value: &Value) -> Entry {
         })
         .or_else(|| value["error"].as_str().map(str::to_owned))
         .unwrap_or_default();
-    Entry {
-        summary: clean(&format!(
+    Entry::new(
+        clean(&format!(
             "{timestamp} {outcome} {} {} {message}",
             request["method"].as_str().unwrap_or(""),
             request["url"].as_str().unwrap_or("")
         ))
         .replace('\n', " "),
-        detail: clean(&serde_json::to_string_pretty(value).unwrap_or_default()),
+        clean(&bounded_json(value)),
         error,
-        invocation: value["outcome"].is_string(),
+        value["outcome"].is_string(),
+    )
+}
+fn bounded_json(value: &Value) -> String {
+    struct Output(Vec<u8>);
+    impl std::io::Write for Output {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let available = (32 * 1024usize).saturating_sub(self.0.len());
+            if available == 0 {
+                return Err(std::io::Error::other("log detail limit"));
+            }
+            let n = bytes.len().min(available);
+            self.0.extend_from_slice(&bytes[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
+    let mut output = Output(Vec::new());
+    let truncated = serde_json::to_writer_pretty(&mut output, value).is_err();
+    let mut detail = String::from_utf8_lossy(&output.0).into_owned();
+    if truncated {
+        detail.push_str("\n[truncated by cftui]");
+    }
+    detail
 }
 fn reader(
     input: impl Read + Send + 'static,
@@ -301,16 +412,16 @@ fn reader(
                     continue;
                 }
                 let text = clean(text.trim());
-                let entry = Entry {
-                    summary: text.clone(),
-                    error: text.to_lowercase().contains("error")
-                        || text.to_lowercase().contains("failed"),
-                    detail: text,
-                    invocation: false,
-                };
+                let entry = Entry::new(
+                    text.clone(),
+                    text.clone(),
+                    text.to_lowercase().contains("error") || text.to_lowercase().contains("failed"),
+                    false,
+                );
                 if tx.try_send(entry).is_err() {
                     dropped.fetch_add(1, Ordering::Relaxed);
                 }
+                crate::wake();
                 continue;
             }
             json.push_str(&text);
@@ -325,6 +436,7 @@ fn reader(
                         dropped.fetch_add(1, Ordering::Relaxed);
                     }
                     json.clear();
+                    crate::wake();
                 }
                 Err(e) if e.is_eof() => {}
                 Err(_) => {
@@ -333,11 +445,63 @@ fn reader(
                 }
             }
         }
+        crate::wake();
     });
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retained_bytes_are_bounded_and_pause_shares_strings() {
+        let mut logs = Logs::default();
+        for _ in 0..600 {
+            logs.push(Entry::new(
+                "large".into(),
+                "x".repeat(32 * 1024),
+                false,
+                true,
+            ));
+        }
+        assert!(logs.bytes <= BUFFER_BYTES);
+        assert!(logs.entries.len() < ENTRY_LIMIT);
+        logs.pause();
+        let frozen = logs.frozen.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&frozen[0], logs.entries.front().unwrap()));
+        let first = frozen[0].clone();
+        for _ in 0..600 {
+            logs.push(Entry::new(
+                "next".into(),
+                "y".repeat(32 * 1024),
+                false,
+                true,
+            ));
+        }
+        let frozen_bytes: usize = logs
+            .frozen
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|e| e.bytes())
+            .sum();
+        assert!(logs.bytes + frozen_bytes <= 2 * BUFFER_BYTES);
+        assert!(Arc::ptr_eq(&first, &logs.rows()[0]));
+        logs.pause();
+        assert_eq!(logs.rows()[0].summary, "next");
+    }
+    #[test]
+    fn detail_truncation_and_cached_filters() {
+        let entry = parse_event(&serde_json::json!({"logs":[{"message":"é".repeat(100_000)}]}));
+        assert!(entry.detail.len() <= 32 * 1024);
+        assert!(entry.detail.contains("[truncated by cftui]"));
+        let mut logs = Logs::default();
+        logs.push(Entry::new("event".into(), "Mixed CASE".into(), false, true));
+        let pointer = logs.rows().as_ptr();
+        assert_eq!(logs.rows().as_ptr(), pointer);
+        logs.filter = "CASE".into();
+        assert_eq!(logs.rows().len(), 1);
+        logs.errors_only = true;
+        assert!(logs.rows().is_empty());
+    }
     #[test]
     fn parses_pretty_events_and_filters_frozen_buffer() {
         let mut logs = Logs::default();

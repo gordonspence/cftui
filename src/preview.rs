@@ -10,7 +10,22 @@ use tui_term::vt100;
 
 /// Export the same cell buffer used by the TUI, not a separate design mockup.
 pub fn write(path: &Path) -> Result<()> {
-    let mut app = App::new(true, String::new(), vec![]);
+    let mut app = App::new(
+        true,
+        String::new(),
+        vec![crate::config::Project {
+            name: "demo-project".into(),
+            path: "./project".into(),
+            environment: "production".into(),
+        }],
+    );
+    app.context = crate::context::Status {
+        git: "main* ↑1".into(),
+        wrangler: "demo".into(),
+        cf: "demo".into(),
+    };
+    app.deployment.worker = Some("api-production".into());
+    app.deployment.summary = "DEMO · Serving · demo0001 100%".into();
     app.snapshot = Some(Snapshot::demo());
     app.refreshing = false;
     let mut screen = vt100::Parser::new(11, 118, 0);

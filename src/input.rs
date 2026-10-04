@@ -219,8 +219,9 @@ pub fn key(app: &mut App, key: KeyEvent) -> Action {
                         app.offset.saturating_sub(1)
                     };
                 } else {
+                    let last = app.logs.rows().len().saturating_sub(1);
                     app.logs.selected = if down {
-                        (app.logs.selected + 1).min(app.logs.rows().len().saturating_sub(1))
+                        (app.logs.selected + 1).min(last)
                     } else {
                         app.logs.selected.saturating_sub(1)
                     };

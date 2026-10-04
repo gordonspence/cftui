@@ -26,9 +26,9 @@ const BAND: Color = Color::Rgb(47, 54, 54);
 fn layout(area: Rect, panels: &Panels) -> [Rect; 5] {
     let content = Rect::new(
         area.x,
-        area.y + 1,
+        area.y + 2,
         area.width,
-        area.height.saturating_sub(2),
+        area.height.saturating_sub(3),
     );
     let mut result = [Rect::default(); 5];
     if let Some(panel) = panels.expanded {
@@ -144,8 +144,9 @@ pub fn mouse(app: &mut App, area: Rect, x: u16, y: u16) {
         let rows = app.logs.rows();
         let selected = app.logs.selected.min(rows.len().saturating_sub(1));
         let offset = selected.saturating_sub(resource.height.saturating_sub(4) as usize);
-        app.logs.selected =
-            (offset + (y - resource.y - 2) as usize).min(rows.len().saturating_sub(1));
+        let next = (offset + (y - resource.y - 2) as usize).min(rows.len().saturating_sub(1));
+        drop(rows);
+        app.logs.selected = next;
         app.logs.follow = false;
     }
 }
@@ -184,20 +185,53 @@ pub fn draw(frame: &mut Frame, app: &App, screen: &vt100::Screen, ended: bool) {
             .as_ref()
             .map_or("waiting", |s| s.fetched_at.as_str())
     };
+    let project = app.projects.get(app.project);
+    let project_name = project.map_or("demo-project", |p| p.name.as_str());
+    let environment = project.map_or("default", |p| {
+        if p.environment.is_empty() {
+            "default"
+        } else {
+            p.environment.as_str()
+        }
+    });
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                " cftui ",
+                format!(" {} ", crate::request::safe_text(project_name)),
                 Style::default()
                     .fg(BG)
                     .bg(CYAN)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!(" {account} "), Style::default().fg(FG)),
-            Span::styled(format!("│ {mode} │ {status}"), Style::default().fg(MUTED)),
+            Span::styled(
+                format!(
+                    " {} │ {} │ CF {account} │ Wrangler {} │ cf {} │ cftui {} alpha",
+                    app.context.git,
+                    crate::request::safe_text(environment),
+                    app.context.wrangler,
+                    app.context.cf,
+                    env!("CARGO_PKG_VERSION")
+                ),
+                Style::default().fg(FG),
+            ),
         ]))
         .style(Style::default().bg(BAND)),
         Rect::new(area.x, area.y, area.width, 1),
+    );
+    let deployment = app.deployment.worker.as_ref().map_or_else(
+        || "Select a Worker for deployment status".into(),
+        |worker| {
+            format!(
+                "Deploy {}: {}",
+                crate::request::safe_text(worker),
+                app.deployment.summary
+            )
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(format!(" {mode} · {status} │ {deployment}"))
+            .style(Style::default().fg(MUTED).bg(BAND)),
+        Rect::new(area.x, area.y + 1, area.width, 1),
     );
     for kind in [Panel::Workers, Panel::D1] {
         let rect = regions[kind.index()];
@@ -1070,6 +1104,38 @@ mod tests {
             .collect()
     }
     #[test]
+    fn header_keeps_project_and_git_context_visible() {
+        let mut app = app();
+        app.projects = vec![crate::config::Project {
+            name: "my-api".into(),
+            path: ".".into(),
+            environment: "production".into(),
+        }];
+        app.context = crate::context::Status {
+            git: "main* ↑2 ↓1".into(),
+            wrangler: "4.0.0".into(),
+            cf: "0.1.0-beta".into(),
+        };
+        app.deployment.worker = Some("api-production".into());
+        app.deployment.summary = "Serving · demo version 100%".into();
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        let screen = vt100::Parser::new(24, 80, 0);
+        terminal
+            .draw(|f| draw(f, &app, screen.screen(), false))
+            .unwrap();
+        let output = text(&terminal);
+        for expected in [
+            "my-api",
+            "main* ↑2 ↓1",
+            "production",
+            "Wrangler 4.0.0",
+            "cf 0.1.0-beta",
+            "Serving · demo version 100%",
+        ] {
+            assert!(output.contains(expected), "missing {expected}");
+        }
+    }
+    #[test]
     fn renders_graphs_and_unavailable_without_fake_activity() {
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         let mut app = app();
@@ -1140,7 +1206,7 @@ mod tests {
                 for panel in Panel::ALL {
                     if app.panels.is_visible(panel) {
                         app.panels.zoom(panel);
-                        assert_eq!(layout(area, &app.panels)[panel.index()].height, h - 2);
+                        assert_eq!(layout(area, &app.panels)[panel.index()].height, h - 3);
                         terminal
                             .draw(|f| draw(f, &app, screen.screen(), false))
                             .unwrap();

@@ -45,9 +45,11 @@ impl Shell {
                         if tx.send(buffer[..n].to_vec()).is_err() {
                             break;
                         }
+                        crate::wake();
                     }
                 }
             }
+            crate::wake();
         });
         Ok(Self {
             master: pair.master,
@@ -59,11 +61,13 @@ impl Shell {
             ended: false,
         })
     }
-    pub fn drain(&mut self) -> Result<()> {
+    pub fn drain(&mut self) -> Result<bool> {
+        let mut changed = false;
         // Bound work per frame so a busy command cannot starve keyboard input.
         for _ in 0..128 {
             match self.output.try_recv() {
                 Ok(bytes) => {
+                    changed = true;
                     self.parser.process(&bytes);
                     let replies = std::mem::take(&mut self.parser.callbacks_mut().bytes);
                     if !replies.is_empty() {
@@ -74,8 +78,11 @@ impl Shell {
                 Err(_) => break,
             }
         }
-        self.ended = self.child.try_wait()?.is_some();
-        Ok(())
+        if !self.ended && self.child.try_wait()?.is_some() {
+            self.ended = true;
+            changed = true;
+        }
+        Ok(changed)
     }
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
         let dims = (rows.max(1), cols.max(1));

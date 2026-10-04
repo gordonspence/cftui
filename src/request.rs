@@ -48,12 +48,14 @@ impl Inspector {
         self.pending = Some(rx);
         thread::spawn(move || {
             let _ = tx.send(fetch(&url).map_err(|e| format!("{e:#}")));
+            crate::wake();
         });
     }
     pub fn busy(&self) -> bool {
         self.pending.is_some()
     }
-    pub fn drain(&mut self) {
+    pub fn drain(&mut self) -> bool {
+        let was_busy = self.busy();
         if let Some(input) = &self.pending {
             match input.try_recv() {
                 Ok(Ok(response)) => {
@@ -72,6 +74,7 @@ impl Inspector {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
+        was_busy && !self.busy()
     }
 }
 fn validate(text: &str) -> Result<Url> {
