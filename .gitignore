@@ -1,0 +1,10 @@
+/target/
+/.tools/
+.env
+.env.*
+!.env.example
+/cftui.toml
+/preview.html
+/preview.png
+/dist/
+/cftui.state.toml

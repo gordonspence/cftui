@@ -1,0 +1,12 @@
+# Copy to cftui.toml. Keep your token in CFTUI_API_TOKEN, not this file.
+account_id = "your-32-character-account-id"
+shell = 'C:\Program Files\Git\bin\bash.exe'
+project_dir = 'C:\path\to\your\project'
+refresh_seconds = 60
+
+# Optional saved projects. F7 switches between these and the Default project above.
+# Uncomment and replace the path with an existing folder.
+# [[projects]]
+# name = "My app"
+# path = 'C:\path\to\another\project'
+# environment = "production"
