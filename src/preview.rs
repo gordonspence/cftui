@@ -31,7 +31,7 @@ pub fn write(path: &Path) -> Result<()> {
     let mut screen = vt100::Parser::new(11, 118, 0);
     screen.process(b"\x1b[32mpreview@local\x1b[0m MINGW64 ~/project\r\n$ \r\n\r\nLayout preview only. Launch cftui to open the real Git Bash session.");
     let mut terminal = Terminal::new(TestBackend::new(120, 40))?;
-    terminal.draw(|frame| ui::draw(frame, &app, screen.screen(), false))?;
+    terminal.draw(|frame| ui::draw(frame, &mut app, screen.screen(), false))?;
     let buffer = terminal.backend().buffer();
     let mut html = String::from("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>cftui · layout preview</title><style>body{margin:0;padding:24px;background:#141718}pre{margin:0;width:max-content;font:14px/18px Consolas,'DejaVu Sans Mono',monospace;white-space:pre;font-variant-ligatures:none}span{display:inline-block;width:1ch;height:18px;overflow:hidden;vertical-align:top}</style><pre aria-label=\"cftui demo layout preview\">");
     for y in 0..40 {

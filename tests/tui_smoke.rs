@@ -10,6 +10,22 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn wait_for(terminal: &mut shell::Shell, expected: &str) {
+    let start = Instant::now();
+    loop {
+        terminal.drain().unwrap();
+        let screen = terminal.parser.screen().contents();
+        if screen.contains(expected) {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "missing {expected}: {screen}"
+        );
+        thread::sleep(Duration::from_millis(30));
+    }
+}
+
 #[test]
 #[ignore = "requires local Git Bash and nested ConPTY"]
 fn idle_dashboard_sleeps_and_shell_output_wakes_it() {
@@ -92,9 +108,31 @@ fn idle_dashboard_sleeps_and_shell_output_wakes_it() {
         );
         thread::sleep(Duration::from_millis(30));
     }
+    // Open help from Bash, change sections and reach the end in the running app.
+    terminal.send(b"\x1bh").unwrap();
+    wait_for(&mut terminal, "Workflows");
+    assert!(terminal
+        .parser
+        .screen()
+        .contents()
+        .contains("Worker stats, Git Bash"));
+    terminal.send(b"\t\t\t").unwrap();
+    wait_for(&mut terminal, "Can't start cftui?");
+    terminal.send(b"\x1b[F").unwrap();
+    wait_for(&mut terminal, "macOS has not been verified.");
     terminal.resize(36, 120).unwrap();
     thread::sleep(Duration::from_millis(300));
     assert!(terminal.drain().unwrap(), "resize did not redraw dashboard");
+    assert!(terminal.parser.screen().contents().contains("Esc close"));
+    terminal.send(b"\x1bh").unwrap();
+    wait_for(&mut terminal, "Git Bash · input");
+    terminal
+        .send(b"printf 'HELP_RESUME_%s\\n' VERIFIED\r")
+        .unwrap();
+    wait_for(&mut terminal, "HELP_RESUME_VERIFIED");
+    // F10 must still exit while help owns input.
+    terminal.send(b"\x1bh").unwrap();
+    wait_for(&mut terminal, "Workflows");
     terminal.send(b"\x1b[21~").unwrap();
     thread::sleep(Duration::from_millis(500));
     drop(terminal);

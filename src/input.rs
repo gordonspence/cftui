@@ -3,7 +3,7 @@ use crate::{
     panels::{Panel, Panels},
     App,
 };
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub enum Action {
     None,
     Quit,
@@ -15,6 +15,40 @@ pub enum Action {
     SendRequest,
 }
 pub fn key(app: &mut App, key: KeyEvent) -> Action {
+    if key.code == KeyCode::F(10) {
+        return Action::Quit;
+    }
+    if matches!(key.code, KeyCode::Char('h' | 'H')) && key.modifiers.contains(KeyModifiers::ALT) {
+        app.help = if app.help.is_some() {
+            None
+        } else {
+            Some(crate::help::Guide::default())
+        };
+        return Action::None;
+    }
+    if let Some(guide) = &mut app.help {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('?') => app.help = None,
+            KeyCode::Left | KeyCode::BackTab => {
+                guide.select(guide.topic + crate::help::TOPICS.len() - 1)
+            }
+            KeyCode::Right | KeyCode::Tab => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    guide.select(guide.topic + crate::help::TOPICS.len() - 1);
+                } else {
+                    guide.select(guide.topic + 1);
+                }
+            }
+            KeyCode::Up => guide.scroll_by(-1),
+            KeyCode::Down => guide.scroll_by(1),
+            KeyCode::PageUp => guide.scroll_by(-i32::from(guide.page_rows)),
+            KeyCode::PageDown => guide.scroll_by(i32::from(guide.page_rows)),
+            KeyCode::Home => guide.scroll = 0,
+            KeyCode::End => guide.scroll = guide.max_scroll,
+            _ => {}
+        }
+        return Action::None;
+    }
     // Modal input owns text, including q, so it never leaks into Bash or exits the app.
     if let Some(index) = &mut app.project_picker {
         match key.code {
@@ -26,13 +60,8 @@ pub fn key(app: &mut App, key: KeyEvent) -> Action {
                 app.project_picker = None;
                 return Action::Switch(i);
             }
-            KeyCode::F(10) => return Action::Quit,
             _ => {}
         }
-        return Action::None;
-    }
-    if app.help {
-        app.help = false;
         return Action::None;
     }
     if app.request.editing {
@@ -42,7 +71,6 @@ pub fn key(app: &mut App, key: KeyEvent) -> Action {
                 return Action::SendRequest;
             }
             KeyCode::Esc => app.request.editing = false,
-            KeyCode::F(10) => return Action::Quit,
             KeyCode::Backspace => {
                 app.request.url.pop();
             }
@@ -106,7 +134,6 @@ pub fn key(app: &mut App, key: KeyEvent) -> Action {
         KeyCode::F(7) => app.project_picker = Some(app.project),
         KeyCode::F(8) => app.panels.close(app.panels.focused),
         KeyCode::F(9) => app.panels.restore(),
-        KeyCode::F(10) => return Action::Quit,
         KeyCode::F(11) => app.panels.zoom(app.panels.focused),
         KeyCode::F(12) => return Action::Save,
         _ if app.panels.shell_input() => return Action::Shell(key),
@@ -131,11 +158,11 @@ pub fn key(app: &mut App, key: KeyEvent) -> Action {
             KeyCode::PageDown => app.request.scroll = app.request.scroll.saturating_add(10),
             KeyCode::Home => app.request.scroll = 0,
             KeyCode::Esc => app.panels.close(Panel::Request),
-            KeyCode::Char('?') => app.help = true,
+            KeyCode::Char('?') => app.help = Some(crate::help::Guide::shortcuts()),
             KeyCode::Char('q') => return Action::Quit,
             _ => {}
         },
-        KeyCode::Char('?') => app.help = true,
+        KeyCode::Char('?') => app.help = Some(crate::help::Guide::shortcuts()),
         KeyCode::Char('q') => return Action::Quit,
         KeyCode::Char('1') => app.panels = Panels::default(),
         KeyCode::Char('2') => {
@@ -312,5 +339,79 @@ mod tests {
         assert_eq!(app.browser.filter, "q");
         press(&mut app, KeyCode::Esc);
         assert!(app.browser.filter.is_empty());
+    }
+    #[test]
+    fn help_owns_input_and_resumes_bash_and_text_entry() {
+        let mut app = app();
+        app.panels.focus(Panel::Bash);
+        let help_key = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT);
+        assert!(matches!(key(&mut app, help_key), Action::None));
+        assert!(app.help.is_some());
+        for code in [
+            KeyCode::Char('q'),
+            KeyCode::Enter,
+            KeyCode::F(6),
+            KeyCode::F(7),
+        ] {
+            assert!(matches!(press(&mut app, code), Action::None));
+            assert!(app.help.is_some());
+        }
+        assert_eq!(app.panels.focused, Panel::Bash);
+        assert!(app.project_picker.is_none());
+        assert!(matches!(press(&mut app, KeyCode::F(10)), Action::Quit));
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('q')),
+            Action::Shell(_)
+        ));
+
+        app.panels.focus(Panel::Resources);
+        press(&mut app, KeyCode::Char('/'));
+        app.browser.filter = "public".into();
+        key(&mut app, help_key);
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Enter);
+        key(&mut app, help_key);
+        assert!(app.browser.editing);
+        assert_eq!(app.browser.filter, "public");
+        press(&mut app, KeyCode::Esc);
+
+        press(&mut app, KeyCode::Char('c'));
+        app.request.url = "http://localhost/health".into();
+        key(&mut app, help_key);
+        assert!(matches!(press(&mut app, KeyCode::Enter), Action::None));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.request.editing);
+        assert_eq!(app.request.url, "http://localhost/health");
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter),
+            Action::SendRequest
+        ));
+    }
+    #[test]
+    fn question_mark_opens_keys_and_help_navigation_never_changes_resources() {
+        let mut app = app();
+        let selected = app.browser.selected.clone();
+        press(&mut app, KeyCode::Char('?'));
+        assert_eq!(app.help.as_ref().unwrap().topic, 1);
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.help.as_ref().unwrap().topic, 0);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.help.as_ref().unwrap().topic, 3);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.help.as_ref().unwrap().topic, 0);
+        app.help.as_mut().unwrap().fit(100, 10);
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(app.help.as_ref().unwrap().scroll, 9);
+        press(&mut app, KeyCode::End);
+        assert_eq!(app.help.as_ref().unwrap().scroll, 90);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.help.as_ref().unwrap().scroll, 89);
+        press(&mut app, KeyCode::Home);
+        assert_eq!(app.help.as_ref().unwrap().scroll, 0);
+        assert_eq!(app.browser.selected, selected);
+        assert_eq!(app.tab, 0);
+        press(&mut app, KeyCode::Char('?'));
+        assert!(app.help.is_none());
     }
 }

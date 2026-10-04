@@ -2,6 +2,7 @@ mod cloudflare;
 mod config;
 mod context;
 mod deployment;
+mod help;
 mod input;
 mod logs;
 mod navigation;
@@ -57,7 +58,7 @@ pub struct App {
     pub project: usize,
     pub project_picker: Option<usize>,
     pub message: String,
-    pub help: bool,
+    pub help: Option<help::Guide>,
     pub request: request::Inspector,
     pub context: context::Status,
     pub deployment: deployment::Status,
@@ -78,7 +79,7 @@ impl App {
             project: 0,
             project_picker: None,
             message: String::new(),
-            help: false,
+            help: None,
             request: request::Inspector::default(),
             context: context::Status::default(),
             deployment: deployment::Status::default(),
@@ -221,7 +222,8 @@ fn main() -> Result<()> {
                     )?;
                 }
                 let shell = sessions.shell();
-                terminal.draw(|frame| ui::draw(frame, &app, shell.parser.screen(), shell.ended))?;
+                terminal
+                    .draw(|frame| ui::draw(frame, &mut app, shell.parser.screen(), shell.ended))?;
                 dirty = false;
             }
             let timeout = Duration::from_secs(5)
@@ -320,9 +322,25 @@ fn main() -> Result<()> {
                         mouse.row,
                     );
                 }
+                Event::Mouse(mouse)
+                    if matches!(
+                        mouse.kind,
+                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                    ) && app.help.is_some() =>
+                {
+                    if let Some(guide) = &mut app.help {
+                        guide.scroll_by(if mouse.kind == MouseEventKind::ScrollUp {
+                            -3
+                        } else {
+                            3
+                        });
+                    }
+                }
                 Event::Resize(_, _) => {}
                 Event::Paste(text)
-                    if app.request.editing && app.project_picker.is_none() && !app.help =>
+                    if app.request.editing
+                        && app.project_picker.is_none()
+                        && app.help.is_none() =>
                 {
                     app.request.url.extend(
                         text.chars()
@@ -330,7 +348,11 @@ fn main() -> Result<()> {
                             .take(4096usize.saturating_sub(app.request.url.chars().count())),
                     );
                 }
-                Event::Paste(text) if app.browser.editing => {
+                Event::Paste(text)
+                    if app.browser.editing
+                        && app.project_picker.is_none()
+                        && app.help.is_none() =>
+                {
                     let filter = if app.browser.view == navigation::View::Logs {
                         &mut app.logs.filter
                     } else {
@@ -346,7 +368,9 @@ fn main() -> Result<()> {
                     }
                 }
                 Event::Paste(text)
-                    if app.panels.shell_input() && app.project_picker.is_none() && !app.help =>
+                    if app.panels.shell_input()
+                        && app.project_picker.is_none()
+                        && app.help.is_none() =>
                 {
                     let shell = sessions.shell();
                     if shell.parser.screen().bracketed_paste() {

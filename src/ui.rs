@@ -100,8 +100,29 @@ pub fn click(panels: &mut Panels, area: Rect, x: u16, y: u16) {
     }
 }
 pub fn mouse(app: &mut App, area: Rect, x: u16, y: u16) {
-    if app.help {
-        app.help = false;
+    if area.width >= 50 && area.height >= 15 && help_button(area).contains((x, y).into()) {
+        app.help = if app.help.is_some() {
+            None
+        } else {
+            Some(crate::help::Guide::default())
+        };
+        return;
+    }
+    if let Some(guide) = &mut app.help {
+        let rect = help_area(area);
+        if y == rect.y && x >= rect.right().saturating_sub(4) && x < rect.right() - 1 {
+            app.help = None;
+        } else if y == rect.y + 1 {
+            let mut start = rect.x + 1;
+            for (index, topic) in crate::help::TOPICS.iter().enumerate() {
+                let end = start + topic.len() as u16 + 2;
+                if x >= start && x < end {
+                    guide.select(index);
+                    break;
+                }
+                start = end + 1;
+            }
+        }
         return;
     }
     if let Some(selected) = app.project_picker {
@@ -151,7 +172,7 @@ pub fn mouse(app: &mut App, area: Rect, x: u16, y: u16) {
     }
 }
 
-pub fn draw(frame: &mut Frame, app: &App, screen: &vt100::Screen, ended: bool) {
+pub fn draw(frame: &mut Frame, app: &mut App, screen: &vt100::Screen, ended: bool) {
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::default().bg(BG).fg(FG)), area);
     if area.width < 50 || area.height < 15 {
@@ -216,7 +237,16 @@ pub fn draw(frame: &mut Frame, app: &App, screen: &vt100::Screen, ended: bool) {
             ),
         ]))
         .style(Style::default().bg(BAND)),
-        Rect::new(area.x, area.y, area.width, 1),
+        Rect::new(area.x, area.y, area.width - help_button(area).width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(" [Help Alt+H] ").style(
+            Style::default()
+                .fg(if app.help.is_some() { BG } else { CYAN })
+                .bg(if app.help.is_some() { CYAN } else { BAND })
+                .add_modifier(Modifier::BOLD),
+        ),
+        help_button(area),
     );
     let deployment = app.deployment.worker.as_ref().map_or_else(
         || "Select a Worker for deployment status".into(),
@@ -356,8 +386,8 @@ pub fn draw(frame: &mut Frame, app: &App, screen: &vt100::Screen, ended: bool) {
     if let Some(index) = app.project_picker {
         project_picker(frame, app, index);
     }
-    if app.help {
-        help(frame);
+    if let Some(guide) = &mut app.help {
+        help(frame, guide);
     }
 }
 fn key(label: &'static str) -> Span<'static> {
@@ -543,11 +573,79 @@ fn project_picker(frame: &mut Frame, app: &App, selected: usize) {
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(rows), inner);
 }
-fn help(frame: &mut Frame) {
-    let area = modal(frame.area());
+fn help_button(area: Rect) -> Rect {
+    let width = area.width.min(14);
+    Rect::new(area.right() - width, area.y, width, 1)
+}
+fn help_area(area: Rect) -> Rect {
+    let width = area.width.saturating_sub(4).min(100);
+    let height = area.height.saturating_sub(4).min(36);
+    Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    )
+}
+fn help(frame: &mut Frame, guide: &mut crate::help::Guide) {
+    let area = help_area(frame.area());
     frame.render_widget(Clear, area);
-    frame.render_widget(Paragraph::new("F1-F4 toggle panels · F6 next · F8 hide · F9 restore · F11 expand\nF7 projects · F12 save layout · F10 quit\nc HTTP inspector · u URL · Enter/r send · Tab headers/body\n\n/ search · s cycle sorting · arrows select · Enter Worker details\nL logs · Esc resource list\nLogs: / search · e errors · Space pause/resume · f follow\nLogs: arrows select · Enter expand · x stop tail · L restart\n\n1 Overview · 2 Debugging · 3 Shell · [ / ] Bash panel size\nProject switching keeps a separate Bash session per project.\nLayouts save on exit. Sample logs in demo mode.\n\nAny key closes help. Shell focus forwards normal typing to Bash.")
-        .wrap(Wrap{trim:false}).block(panel(" Help ",CYAN)),area);
+    let block = panel(" Help ", CYAN)
+        .title_top(Line::styled("[x]", Style::default().fg(CYAN)).alignment(Alignment::Right));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let mut tabs = Vec::new();
+    for (index, topic) in crate::help::TOPICS.iter().enumerate() {
+        tabs.push(Span::styled(
+            format!(" {topic} "),
+            if index == guide.topic {
+                Style::default()
+                    .fg(BG)
+                    .bg(CYAN)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(MUTED).bg(BAND)
+            },
+        ));
+        tabs.push(Span::raw(" "));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(tabs)),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+    let body = Rect::new(
+        inner.x + 1,
+        inner.y + 2,
+        inner.width.saturating_sub(2),
+        inner.height.saturating_sub(3),
+    );
+    let lines = crate::help::lines(
+        guide.topic,
+        body.width,
+        Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+        Style::default().fg(CYAN),
+    );
+    guide.fit(lines.len(), body.height);
+    let position = format!(
+        " {}-{} / {} ",
+        guide.scroll + 1,
+        (guide.scroll as usize + body.height as usize).min(lines.len()),
+        lines.len()
+    );
+    frame.render_widget(Paragraph::new(lines).scroll((guide.scroll, 0)), body);
+    frame.render_widget(
+        Paragraph::new("Tab section · ↑↓ scroll · Esc close").style(Style::default().fg(MUTED)),
+        Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(position.as_str()).style(Style::default().fg(MUTED).bg(BG)),
+        Rect::new(
+            area.right() - position.len() as u16 - 2,
+            area.bottom() - 1,
+            position.len() as u16,
+            1,
+        ),
+    );
 }
 fn logs(frame: &mut Frame, area: Rect, app: &App) {
     let logs = &app.logs;
@@ -1121,7 +1219,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
         let screen = vt100::Parser::new(24, 80, 0);
         terminal
-            .draw(|f| draw(f, &app, screen.screen(), false))
+            .draw(|f| draw(f, &mut app, screen.screen(), false))
             .unwrap();
         let output = text(&terminal);
         for expected in [
@@ -1136,12 +1234,85 @@ mod tests {
         }
     }
     #[test]
+    fn help_tabs_scroll_to_the_last_line_at_every_supported_size() {
+        let screen = vt100::Parser::new(24, 80, 0);
+        for (w, h) in [(50, 15), (80, 24), (120, 40)] {
+            let mut app = app();
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            for topic in 0..crate::help::TOPICS.len() {
+                let mut guide = crate::help::Guide::default();
+                guide.select(topic);
+                app.help = Some(guide);
+                terminal
+                    .draw(|f| draw(f, &mut app, screen.screen(), false))
+                    .unwrap();
+                let output = text(&terminal);
+                for label in [
+                    "[Help Alt+H]",
+                    "Setup",
+                    "Keys",
+                    "Workflows",
+                    "Fixes",
+                    "Esc close",
+                ] {
+                    assert!(output.contains(label), "missing {label} at {w}x{h}");
+                }
+                let rect = help_area(Rect::new(0, 0, w, h));
+                let lines =
+                    crate::help::lines(topic, rect.width - 4, Style::default(), Style::default());
+                assert!(lines
+                    .iter()
+                    .all(|line| line.width() <= (rect.width - 4) as usize));
+                assert!(app.help.as_ref().unwrap().max_scroll > 0);
+                crate::input::key(
+                    &mut app,
+                    crossterm::event::KeyEvent::new(
+                        crossterm::event::KeyCode::End,
+                        crossterm::event::KeyModifiers::NONE,
+                    ),
+                );
+                terminal
+                    .draw(|f| draw(f, &mut app, screen.screen(), false))
+                    .unwrap();
+                let last = lines.last().unwrap().spans[0].content.as_ref();
+                assert!(
+                    text(&terminal).contains(last),
+                    "last line inaccessible at {w}x{h}: {last}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn help_mouse_tabs_and_close_preserve_the_underlying_input() {
+        let mut app = app();
+        let area = Rect::new(3, 4, 80, 24);
+        app.panels.focus(Panel::Bash);
+        app.request.editing = true;
+        app.request.url = "http://localhost/health".into();
+        mouse(&mut app, area, area.right() - 8, area.y);
+        assert!(app.help.is_some());
+        let rect = help_area(area);
+        mouse(&mut app, area, rect.x + 10, rect.y + 1);
+        assert_eq!(app.help.as_ref().unwrap().topic, 1);
+        // A click in guide content must not close help or change panel focus.
+        mouse(&mut app, area, rect.x + 5, rect.y + 5);
+        assert!(app.help.is_some());
+        mouse(&mut app, area, rect.right() - 3, rect.y);
+        assert!(app.help.is_none());
+        assert_eq!(app.panels.focused, Panel::Bash);
+        assert!(app.request.editing);
+        assert_eq!(app.request.url, "http://localhost/health");
+        mouse(&mut app, area, area.right() - 8, area.y);
+        mouse(&mut app, area, area.right() - 8, area.y);
+        assert!(app.help.is_none());
+    }
+    #[test]
     fn renders_graphs_and_unavailable_without_fake_activity() {
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         let mut app = app();
         let screen = vt100::Parser::new(24, 80, 0);
         terminal
-            .draw(|f| draw(f, &app, screen.screen(), false))
+            .draw(|f| draw(f, &mut app, screen.screen(), false))
             .unwrap();
         assert!(text(&terminal).contains("210,620"));
         assert!(text(&terminal).contains("api-production"));
@@ -1153,7 +1324,7 @@ mod tests {
             .warnings
             .push("Workers: Analytics query rejected".into());
         terminal
-            .draw(|f| draw(f, &app, screen.screen(), false))
+            .draw(|f| draw(f, &mut app, screen.screen(), false))
             .unwrap();
         assert!(text(&terminal).contains("history unavailable"));
         assert!(text(&terminal).contains("Analytics query rejected"));
@@ -1165,7 +1336,7 @@ mod tests {
         for (w, h) in [(50, 15), (80, 24), (120, 40)] {
             let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
             terminal
-                .draw(|f| draw(f, &app(), screen.screen(), false))
+                .draw(|f| draw(f, &mut app(), screen.screen(), false))
                 .unwrap();
             assert!(text(&terminal).contains("Resources"));
             assert!(text(&terminal).contains("Git Bash"));
@@ -1198,7 +1369,7 @@ mod tests {
                 }
                 let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
                 terminal
-                    .draw(|f| draw(f, &app, screen.screen(), false))
+                    .draw(|f| draw(f, &mut app, screen.screen(), false))
                     .unwrap();
                 if mask == 0 {
                     assert!(text(&terminal).contains("All panels hidden"));
@@ -1208,7 +1379,7 @@ mod tests {
                         app.panels.zoom(panel);
                         assert_eq!(layout(area, &app.panels)[panel.index()].height, h - 3);
                         terminal
-                            .draw(|f| draw(f, &app, screen.screen(), false))
+                            .draw(|f| draw(f, &mut app, screen.screen(), false))
                             .unwrap();
                         assert!(text(&terminal).contains("[-][x]"));
                         app.panels.zoom(panel);
@@ -1274,13 +1445,13 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         let screen = vt100::Parser::new(24, 80, 0);
         terminal
-            .draw(|f| draw(f, &app, screen.screen(), false))
+            .draw(|f| draw(f, &mut app, screen.screen(), false))
             .unwrap();
         assert!(text(&terminal).contains("128,430"));
         assert!(!text(&terminal).contains("210,620"));
         app.snapshot.as_mut().unwrap().worker_histories = None;
         terminal
-            .draw(|f| draw(f, &app, screen.screen(), false))
+            .draw(|f| draw(f, &mut app, screen.screen(), false))
             .unwrap();
         assert!(text(&terminal).contains("history unavailable"));
         app.logs
@@ -1299,24 +1470,24 @@ mod tests {
         app.browser.view = View::Logs;
         app.logs.errors_only = true;
         terminal
-            .draw(|f| draw(f, &app, screen.screen(), false))
+            .draw(|f| draw(f, &mut app, screen.screen(), false))
             .unwrap();
         assert!(text(&terminal).contains("database request failed"));
         app.logs.expanded = true;
         terminal
-            .draw(|f| draw(f, &app, screen.screen(), false))
+            .draw(|f| draw(f, &mut app, screen.screen(), false))
             .unwrap();
         assert!(text(&terminal).contains("exceptions"));
         for (w, h) in [(50, 15), (80, 24)] {
             let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
             terminal
-                .draw(|f| draw(f, &app, screen.screen(), false))
+                .draw(|f| draw(f, &mut app, screen.screen(), false))
                 .unwrap();
-            app.help = true;
+            app.help = Some(crate::help::Guide::default());
             terminal
-                .draw(|f| draw(f, &app, screen.screen(), false))
+                .draw(|f| draw(f, &mut app, screen.screen(), false))
                 .unwrap();
-            app.help = false;
+            app.help = None;
         }
     }
     #[test]
@@ -1329,7 +1500,7 @@ mod tests {
         for (w, h) in [(50, 15), (80, 24), (120, 40)] {
             let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
             terminal
-                .draw(|f| draw(f, &app, screen.screen(), false))
+                .draw(|f| draw(f, &mut app, screen.screen(), false))
                 .unwrap();
             assert!(text(&terminal).contains("Connection refused"));
             assert!(text(&terminal).contains("HTTP request"));
