@@ -1,3 +1,4 @@
+mod app;
 mod cloudflare;
 mod config;
 mod context;
@@ -14,6 +15,7 @@ mod shell;
 mod ui;
 
 use anyhow::{bail, Result};
+use app::App;
 use clap::Parser;
 use cloudflare::{Cloudflare, Snapshot};
 use config::{Args, Config};
@@ -24,7 +26,6 @@ use crossterm::{
     },
     execute,
 };
-use panels::{Panel, Panels};
 use shell::Shell;
 use std::{
     io,
@@ -41,49 +42,6 @@ static UPDATES: OnceLock<mpsc::SyncSender<Update>> = OnceLock::new();
 pub(crate) fn wake() {
     if let Some(tx) = UPDATES.get() {
         let _ = tx.try_send(Update::Wake);
-    }
-}
-
-pub struct App {
-    pub snapshot: Option<Snapshot>,
-    pub demo: bool,
-    pub panels: Panels,
-    pub tab: usize,
-    pub offset: usize,
-    pub refreshing: bool,
-    pub account: String,
-    pub browser: navigation::Browser,
-    pub logs: logs::Logs,
-    pub projects: Vec<config::Project>,
-    pub project: usize,
-    pub project_picker: Option<usize>,
-    pub message: String,
-    pub help: Option<help::Guide>,
-    pub request: request::Inspector,
-    pub context: context::Status,
-    pub deployment: deployment::Status,
-}
-impl App {
-    pub fn new(demo: bool, account: String, projects: Vec<config::Project>) -> Self {
-        Self {
-            snapshot: None,
-            demo,
-            panels: Panels::default(),
-            tab: 0,
-            offset: 0,
-            refreshing: true,
-            account,
-            browser: navigation::Browser::default(),
-            logs: logs::Logs::default(),
-            projects,
-            project: 0,
-            project_picker: None,
-            message: String::new(),
-            help: None,
-            request: request::Inspector::default(),
-            context: context::Status::default(),
-            deployment: deployment::Status::default(),
-        }
     }
 }
 
@@ -185,12 +143,7 @@ fn main() -> Result<()> {
                 app.logs.selected = last;
             }
             if let Ok(snapshot) = result_rx.try_recv() {
-                app.snapshot = Some(snapshot);
-                app.browser.invalidate();
-                if let Some(snapshot) = &app.snapshot {
-                    app.browser.reconcile(snapshot, app.tab);
-                }
-                app.refreshing = false;
+                app.refresh_completed(snapshot);
                 last_refresh = Instant::now();
                 dirty = true;
             }
@@ -265,22 +218,11 @@ fn main() -> Result<()> {
                             };
                         }
                         input::Action::Switch(index) => {
-                            match sessions.switch(index, &config.shell) {
-                                Ok(()) => {
-                                    if index != app.project {
-                                        app.logs.stop();
-                                    }
-                                    app.project = index;
-                                    app.context = context::Status::default();
-                                    context.refresh(index, &app.projects[index]);
-                                    app.message = format!(
-                                        "Project: {} · separate Bash session",
-                                        app.projects[index].name
-                                    );
-                                    app.panels.visible[3] = true;
-                                    app.panels.focus(Panel::Bash);
-                                }
-                                Err(e) => app.message = format!("Could not switch project: {e}"),
+                            if app.project_switch_completed(
+                                index,
+                                sessions.switch(index, &config.shell),
+                            ) {
+                                context.refresh(index, &app.projects[index]);
                             }
                         }
                         input::Action::Tail(worker) => {
@@ -291,13 +233,7 @@ fn main() -> Result<()> {
                                 &worker,
                                 app.demo,
                             ) {
-                                Ok(()) => {
-                                    app.browser.worker = Some(worker);
-                                    app.browser.view = navigation::View::Logs;
-                                    app.panels.visible[2] = true;
-                                    app.panels.focus(Panel::Resources);
-                                    app.offset = 0;
-                                }
+                                Ok(()) => app.logs_started(worker),
                                 Err(e) => app.message = format!("Could not start logs: {e}"),
                             }
                         }

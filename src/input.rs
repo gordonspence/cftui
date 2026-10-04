@@ -198,9 +198,7 @@ pub fn key(app: &mut App, key: KeyEvent) -> Action {
             app.browser.sort = app.browser.sort.next()
         }
         KeyCode::Tab | KeyCode::Left | KeyCode::Right if app.browser.view == View::List => {
-            app.tab = 1 - app.tab;
-            app.browser.selected = None;
-            app.offset = 0;
+            app.switch_resource_tab();
         }
         KeyCode::Char('l') | KeyCode::Char('L') => {
             let worker = if app.browser.view == View::List && app.tab == 0 {
@@ -227,13 +225,7 @@ pub fn key(app: &mut App, key: KeyEvent) -> Action {
             app.offset = 0;
         }
         KeyCode::Enter if app.tab == 0 => {
-            app.browser.worker = app.browser.selected.clone();
-            if app.browser.worker.is_some() {
-                app.browser.view = View::Details;
-                app.panels.visible[2] = true;
-                app.panels.focus(Panel::Resources);
-                app.offset = 0;
-            }
+            app.show_worker_details();
         }
         KeyCode::Up | KeyCode::Down => {
             let down = key.code == KeyCode::Down;

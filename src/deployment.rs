@@ -26,12 +26,20 @@ impl Monitor {
     pub fn update(&mut self, worker: Option<&str>, status: &mut Status, force: bool) -> bool {
         let mut changed = false;
         if let Some(rx) = &self.pending {
-            if let Ok((source, summary)) = rx.try_recv() {
-                self.pending = None;
-                if worker == Some(source.as_str()) {
-                    status.summary = summary;
+            match rx.try_recv() {
+                Ok((source, summary)) => {
+                    self.pending = None;
+                    if worker == Some(source.as_str()) {
+                        status.summary = summary;
+                        changed = true;
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending = None;
+                    status.summary = "Deployment check failed".into();
                     changed = true;
                 }
+                Err(mpsc::TryRecvError::Empty) => {}
             }
         }
         let switched = status.worker.as_deref() != worker;
@@ -72,5 +80,57 @@ impl Monitor {
             });
         }
         changed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disconnected_check_clears_pending_and_can_be_retried() {
+        let mut monitor = Monitor::new(None);
+        let (tx, rx) = mpsc::channel();
+        monitor.pending = Some(rx);
+        drop(tx);
+        let mut status = Status {
+            worker: Some("api".into()),
+            summary: "Checking deployment…".into(),
+        };
+
+        assert!(monitor.update(Some("api"), &mut status, false));
+        assert!(monitor.pending.is_none());
+        assert_eq!(status.summary, "Deployment check failed");
+
+        // Automatic polling resumes after its normal interval.
+        monitor.last = Instant::now() - Duration::from_secs(61);
+        monitor.update(Some("api"), &mut status, false);
+        let (source, summary) = monitor
+            .pending
+            .take()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(source, "api");
+        assert!(summary.contains("DEMO"));
+    }
+
+    #[test]
+    fn empty_check_stays_pending_and_stale_result_is_ignored() {
+        let mut monitor = Monitor::new(None);
+        let (tx, rx) = mpsc::channel();
+        monitor.pending = Some(rx);
+        let mut status = Status {
+            worker: Some("current".into()),
+            summary: "Current deployment".into(),
+        };
+        assert!(!monitor.update(Some("current"), &mut status, false));
+        assert!(monitor.pending.is_some());
+
+        tx.send(("previous".into(), "Stale deployment".into()))
+            .unwrap();
+        assert!(!monitor.update(Some("current"), &mut status, false));
+        assert!(monitor.pending.is_none());
+        assert_eq!(status.summary, "Current deployment");
     }
 }
