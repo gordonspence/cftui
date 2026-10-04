@@ -168,8 +168,4 @@ bash run.sh --preview preview.html
 
 The preview uses your browser's monospace font; the live TUI uses your terminal's font. Generated previews are ignored by Git.
 
-## Project status
-
-Windows is the supported platform for this alpha. macOS code paths have not been built or tested on a Mac. The tests and CI use demo data and local HTTP fixtures; Workers/D1 analytics and Wrangler logs still need a real-account smoke test before a release is described as live-verified. Contributions and reproducible bug reports are welcome. Please remove tokens, account identifiers, request headers, and log content from public issues.
-
-The GitHub Actions workflow runs formatting, tests, Clippy, and a Windows release build. Its uploaded ZIP is a build artifact for review; publishing a GitHub Release is a separate step.
+just messing around
